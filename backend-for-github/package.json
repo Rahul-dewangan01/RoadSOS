@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "node --no-warnings server.js",
-    "start": "NODE_ENV=production node --no-warnings server.js"
+    "start": "node --no-warnings server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

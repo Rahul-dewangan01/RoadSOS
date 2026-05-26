@@ -234,6 +234,10 @@ function generateOtp() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
+function shouldShowDevOtps() {
+  return process.env.NODE_ENV !== "production" || process.env.SHOW_DEV_OTPS === "true";
+}
+
 function getData(userId, key, fallback) {
   const row = db.prepare("SELECT data_json FROM user_data WHERE user_id = ? AND data_key = ?").get(userId, key);
   return row ? JSON.parse(row.data_json) : fallback;
@@ -287,7 +291,7 @@ app.post("/api/auth/request-signup-otp", (req, res, next) => {
     // - Send phoneCode via Twilio SMS to body.phone
     // - Send emailCode via Nodemailer/SendGrid to body.email
 
-    const isDev = process.env.NODE_ENV !== "production";
+    const isDev = shouldShowDevOtps();
     res.json({
       ok: true,
       devPhoneOtp: isDev ? phoneCode : undefined,
@@ -374,7 +378,7 @@ app.post("/api/auth/request-otp", (req, res, next) => {
     `).run(phone, code, now() + 5 * 60 * 1000);
 
     // Production hook: send code via Twilio Verify
-    const isDev = process.env.NODE_ENV !== "production";
+    const isDev = shouldShowDevOtps();
     res.json({ ok: true, devOtp: isDev ? code : undefined });
   } catch (error) {
     next(error);
