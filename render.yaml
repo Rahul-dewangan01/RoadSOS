@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: roadsos-backend
+    runtime: node
+    plan: free
+    rootDir: backend-for-github
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: APP_ORIGIN
+        value: "*"
+      - key: DATABASE_PATH
+        value: ./roadsos.sqlite
+      - key: SHOW_DEV_OTPS
+        value: "true"
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
