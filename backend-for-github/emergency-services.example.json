@@ -1,0 +1,13 @@
+[
+  {
+    "id": "official-service-id",
+    "name": "Official Service Name",
+    "type": "hospital",
+    "latitude": 21.8967,
+    "longitude": 83.407,
+    "phone": "+911234567890",
+    "address": "Verified street address",
+    "operatingArea": "City / district / highway corridor served",
+    "lastUpdated": 1760000000000
+  }
+]
