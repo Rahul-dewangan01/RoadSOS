@@ -102,6 +102,47 @@ db.exec(`
     operating_area TEXT NOT NULL DEFAULT '',
     last_updated   INTEGER NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS volunteer_profiles (
+    user_id       TEXT PRIMARY KEY,
+    full_name     TEXT NOT NULL DEFAULT '',
+    age           INTEGER NOT NULL DEFAULT 0,
+    gender        TEXT NOT NULL DEFAULT '',
+    blood_group   TEXT NOT NULL DEFAULT '',
+    skills        TEXT NOT NULL DEFAULT '',
+    city_area     TEXT NOT NULL DEFAULT '',
+    id_proof_type TEXT NOT NULL DEFAULT '',
+    id_proof_ref  TEXT NOT NULL DEFAULT '',
+    verified_at   INTEGER NOT NULL DEFAULT 0,
+    updated_at    INTEGER NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS volunteer_status (
+    user_id      TEXT PRIMARY KEY,
+    mode_enabled INTEGER NOT NULL DEFAULT 0,
+    status       TEXT NOT NULL DEFAULT 'OFFLINE',
+    latitude     REAL,
+    longitude    REAL,
+    current_request_id TEXT NOT NULL DEFAULT '',
+    updated_at   INTEGER NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS volunteer_alerts (
+    id          TEXT PRIMARY KEY,
+    victim_id   TEXT NOT NULL,
+    volunteer_id TEXT NOT NULL,
+    emergency_type TEXT NOT NULL DEFAULT '',
+    details     TEXT NOT NULL DEFAULT '',
+    approx_lat  REAL,
+    approx_lng  REAL,
+    status      TEXT NOT NULL DEFAULT 'NOTIFIED',
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    FOREIGN KEY(victim_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY(volunteer_id) REFERENCES users(id) ON DELETE CASCADE
+  );
 `);
 
 // Add missing columns for existing databases
@@ -160,6 +201,36 @@ const profileSchema = z.object({
   temporaryAddress: z.union([z.string(), addressSchema]).optional().default(""),
   profileImageBase64: z.string().nullable().optional(),
   createdAt: z.number().optional()
+});
+
+const volunteerDetailsSchema = z.object({
+  fullName: z.string().trim().min(2).max(100),
+  age: z.coerce.number().int().min(18).max(100),
+  gender: z.string().trim().min(1).max(40),
+  bloodGroup: z.string().trim().max(8).optional().default(""),
+  skillsExperience: z.string().trim().min(3).max(1000),
+  cityArea: z.string().trim().min(2).max(160),
+  idProofType: z.string().trim().max(80).optional().default(""),
+  idProofReference: z.string().trim().max(120).optional().default(""),
+  availabilityStatus: z.enum(["ONLINE", "OFFLINE", "BUSY"]).optional().default("OFFLINE"),
+  verifiedAt: z.number().optional().default(0),
+  lastLat: z.number().nullable().optional(),
+  lastLng: z.number().nullable().optional(),
+  updatedAt: z.number().optional()
+});
+
+const volunteerStatusSchema = z.object({
+  modeEnabled: z.boolean(),
+  status: z.enum(["ONLINE", "OFFLINE", "BUSY"]).optional().default("OFFLINE"),
+  lat: z.number().min(-90).max(90).nullable().optional(),
+  lng: z.number().min(-180).max(180).nullable().optional()
+});
+
+const volunteerAlertSchema = z.object({
+  lat: z.number().min(-90).max(90).nullable().optional(),
+  lng: z.number().min(-180).max(180).nullable().optional(),
+  emergencyType: z.string().trim().max(120).optional().default("Emergency"),
+  details: z.string().trim().max(1000).optional().default("")
 });
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -234,10 +305,6 @@ function generateOtp() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
-function shouldShowDevOtps() {
-  return process.env.NODE_ENV !== "production" || process.env.SHOW_DEV_OTPS === "true";
-}
-
 function getData(userId, key, fallback) {
   const row = db.prepare("SELECT data_json FROM user_data WHERE user_id = ? AND data_key = ?").get(userId, key);
   return row ? JSON.parse(row.data_json) : fallback;
@@ -249,6 +316,77 @@ function putData(userId, key, value) {
     VALUES (?, ?, ?, ?)
     ON CONFLICT(user_id, data_key) DO UPDATE SET data_json = excluded.data_json, updated_at = excluded.updated_at
   `).run(userId, key, JSON.stringify(value), now());
+}
+
+function getVolunteerDetails(userId) {
+  const row = db.prepare(`
+    SELECT p.*, s.mode_enabled, s.status, s.latitude, s.longitude
+    FROM volunteer_profiles p
+    LEFT JOIN volunteer_status s ON s.user_id = p.user_id
+    WHERE p.user_id = ?
+  `).get(userId);
+  if (!row) return null;
+  return {
+    fullName: row.full_name,
+    age: row.age,
+    gender: row.gender,
+    bloodGroup: row.blood_group || "",
+    skillsExperience: row.skills || "",
+    cityArea: row.city_area || "",
+    idProofType: row.id_proof_type || "",
+    idProofReference: row.id_proof_ref ? "stored" : "",
+    availabilityStatus: row.status || "OFFLINE",
+    verifiedAt: row.verified_at || 0,
+    lastLat: row.latitude ?? null,
+    lastLng: row.longitude ?? null,
+    updatedAt: row.updated_at
+  };
+}
+
+function isVolunteerComplete(details) {
+  return details && details.fullName?.trim().length >= 2 &&
+    details.age >= 18 && details.age <= 100 &&
+    details.gender?.trim() &&
+    details.skillsExperience?.trim().length >= 3 &&
+    details.cityArea?.trim().length >= 2;
+}
+
+function publicVolunteerService(row, lat, lng) {
+  return {
+    id: `volunteer_${row.user_id}`,
+    name: row.full_name || "Road SoS Volunteer",
+    category: "Volunteer",
+    serviceType: "VOLUNTEER",
+    distanceKm: Number(distanceKm(lat, lng, row.latitude, row.longitude).toFixed(2)),
+    phone: "",
+    address: row.city_area || "Approximate nearby area",
+    lat: roundApprox(row.latitude),
+    lng: roundApprox(row.longitude),
+    source: "roadsos_volunteers",
+    isOfflineFallback: false
+  };
+}
+
+function roundApprox(value) {
+  return typeof value === "number" ? Number(value.toFixed(3)) : 0;
+}
+
+function findNearbyActiveVolunteers(lat, lng, radiusKm = 8, excludeUserId = "") {
+  if (typeof lat !== "number" || typeof lng !== "number") return [];
+  return db.prepare(`
+    SELECT p.user_id, p.full_name, p.city_area, p.skills, s.latitude, s.longitude
+    FROM volunteer_profiles p
+    JOIN volunteer_status s ON s.user_id = p.user_id
+    WHERE s.mode_enabled = 1
+      AND s.status = 'ONLINE'
+      AND s.latitude IS NOT NULL
+      AND s.longitude IS NOT NULL
+      AND p.user_id != ?
+  `).all(excludeUserId)
+    .map((row) => ({ ...row, distanceKm: distanceKm(lat, lng, row.latitude, row.longitude) }))
+    .filter((row) => row.distanceKm <= radiusKm)
+    .sort((a, b) => a.distanceKm - b.distanceKm)
+    .slice(0, 10);
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -291,7 +429,7 @@ app.post("/api/auth/request-signup-otp", (req, res, next) => {
     // - Send phoneCode via Twilio SMS to body.phone
     // - Send emailCode via Nodemailer/SendGrid to body.email
 
-    const isDev = shouldShowDevOtps();
+    const isDev = process.env.NODE_ENV !== "production";
     res.json({
       ok: true,
       devPhoneOtp: isDev ? phoneCode : undefined,
@@ -378,7 +516,7 @@ app.post("/api/auth/request-otp", (req, res, next) => {
     `).run(phone, code, now() + 5 * 60 * 1000);
 
     // Production hook: send code via Twilio Verify
-    const isDev = shouldShowDevOtps();
+    const isDev = process.env.NODE_ENV !== "production";
     res.json({ ok: true, devOtp: isDev ? code : undefined });
   } catch (error) {
     next(error);
@@ -462,6 +600,156 @@ app.put("/api/me/profile", requireAuth, (req, res, next) => {
     );
 
     res.json(publicUser(getUserById(req.user.id)));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/me/volunteer", requireAuth, (req, res) => {
+  res.json(getVolunteerDetails(req.user.id) || {});
+});
+
+app.put("/api/me/volunteer", requireAuth, (req, res, next) => {
+  try {
+    const details = parseBody(volunteerDetailsSchema, req.body);
+    const ts = now();
+    db.prepare(`
+      INSERT INTO volunteer_profiles
+        (user_id, full_name, age, gender, blood_group, skills, city_area, id_proof_type, id_proof_ref, verified_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        full_name = excluded.full_name,
+        age = excluded.age,
+        gender = excluded.gender,
+        blood_group = excluded.blood_group,
+        skills = excluded.skills,
+        city_area = excluded.city_area,
+        id_proof_type = excluded.id_proof_type,
+        id_proof_ref = excluded.id_proof_ref,
+        verified_at = excluded.verified_at,
+        updated_at = excluded.updated_at
+    `).run(
+      req.user.id,
+      details.fullName,
+      details.age,
+      details.gender,
+      details.bloodGroup || "",
+      details.skillsExperience,
+      details.cityArea,
+      details.idProofType || "",
+      details.idProofReference || "",
+      details.verifiedAt || ts,
+      ts
+    );
+    db.prepare(`
+      INSERT INTO volunteer_status (user_id, mode_enabled, status, latitude, longitude, updated_at)
+      VALUES (?, 0, ?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        status = excluded.status,
+        latitude = COALESCE(excluded.latitude, volunteer_status.latitude),
+        longitude = COALESCE(excluded.longitude, volunteer_status.longitude),
+        updated_at = excluded.updated_at
+    `).run(req.user.id, details.availabilityStatus || "OFFLINE", details.lastLat ?? null, details.lastLng ?? null, ts);
+    res.json({ ok: true, modeEnabled: false, status: details.availabilityStatus || "OFFLINE", detailsComplete: true, details: getVolunteerDetails(req.user.id) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/me/volunteer/status", requireAuth, (req, res, next) => {
+  try {
+    const body = parseBody(volunteerStatusSchema, req.body);
+    const details = getVolunteerDetails(req.user.id);
+    if (body.modeEnabled && !isVolunteerComplete(details)) {
+      return res.status(409).json({ error: "Volunteer verification is required before enabling volunteer mode." });
+    }
+    const status = body.modeEnabled ? body.status : "OFFLINE";
+    db.prepare(`
+      INSERT INTO volunteer_status (user_id, mode_enabled, status, latitude, longitude, current_request_id, updated_at)
+      VALUES (?, ?, ?, ?, ?, '', ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        mode_enabled = excluded.mode_enabled,
+        status = excluded.status,
+        latitude = COALESCE(excluded.latitude, volunteer_status.latitude),
+        longitude = COALESCE(excluded.longitude, volunteer_status.longitude),
+        current_request_id = CASE WHEN excluded.status = 'ONLINE' THEN '' ELSE volunteer_status.current_request_id END,
+        updated_at = excluded.updated_at
+    `).run(req.user.id, body.modeEnabled ? 1 : 0, status, body.lat ?? null, body.lng ?? null, now());
+    putData(req.user.id, "settings", { ...getData(req.user.id, "settings", {}), volunteer_mode: body.modeEnabled, volunteer_availability: status });
+    res.json({ ok: true, modeEnabled: body.modeEnabled, status, detailsComplete: !!details, details: getVolunteerDetails(req.user.id) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/me/volunteer/alerts", requireAuth, (req, res, next) => {
+  try {
+    const alerts = db.prepare(`
+      SELECT id, emergency_type, details, approx_lat, approx_lng, status, created_at
+      FROM volunteer_alerts
+      WHERE volunteer_id = ? AND status = 'NOTIFIED'
+      ORDER BY created_at DESC
+      LIMIT 5
+    `).all(req.user.id).map((row) => ({
+      requestId: row.id.split("_")[0],
+      alertId: row.id,
+      emergencyType: row.emergency_type,
+      details: row.details,
+      approxLat: row.approx_lat,
+      approxLng: row.approx_lng,
+      status: row.status,
+      createdAt: row.created_at
+    }));
+    res.json(alerts);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/volunteer-alerts", requireAuth, (req, res, next) => {
+  try {
+    const body = parseBody(volunteerAlertSchema, req.body);
+    if (typeof body.lat !== "number" || typeof body.lng !== "number") {
+      return res.json({ ok: true, requestId: "", notifiedCount: 0, volunteers: [], message: "GPS Required: volunteer matching paused safely." });
+    }
+    const volunteers = findNearbyActiveVolunteers(body.lat, body.lng, 8, req.user.id);
+    if (volunteers.length === 0) {
+      return res.json({ ok: true, requestId: "", notifiedCount: 0, volunteers: [], message: "No nearby volunteers are online right now." });
+    }
+    const requestGroupId = nanoid(18);
+    const ts = now();
+    const stmt = db.prepare(`
+      INSERT INTO volunteer_alerts (id, victim_id, volunteer_id, emergency_type, details, approx_lat, approx_lng, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'NOTIFIED', ?, ?)
+    `);
+    for (const volunteer of volunteers) {
+      stmt.run(`${requestGroupId}_${volunteer.user_id}`, req.user.id, volunteer.user_id, body.emergencyType, body.details, roundApprox(body.lat), roundApprox(body.lng), ts, ts);
+    }
+    res.json({
+      ok: true,
+      requestId: requestGroupId,
+      notifiedCount: volunteers.length,
+      volunteers: volunteers.map((v) => publicVolunteerService(v, body.lat, body.lng)),
+      message: "Nearby Volunteers Notified"
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/volunteer-alerts/:requestId/accept", requireAuth, (req, res, next) => {
+  try {
+    const alertId = `${req.params.requestId}_${req.user.id}`;
+    const alert = db.prepare("SELECT * FROM volunteer_alerts WHERE id = ? AND volunteer_id = ?").get(alertId, req.user.id);
+    if (!alert) return res.status(404).json({ error: "Volunteer request not found." });
+    const ts = now();
+    db.prepare("UPDATE volunteer_alerts SET status = 'ACCEPTED', updated_at = ? WHERE id = ?").run(ts, alert.id);
+    db.prepare(`
+      INSERT INTO volunteer_status (user_id, mode_enabled, status, current_request_id, updated_at)
+      VALUES (?, 1, 'BUSY', ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET status = 'BUSY', current_request_id = excluded.current_request_id, updated_at = excluded.updated_at
+    `).run(req.user.id, alert.id, ts);
+    res.json({ ok: true, modeEnabled: true, status: "BUSY", detailsComplete: true, details: getVolunteerDetails(req.user.id) });
   } catch (error) {
     next(error);
   }
@@ -733,6 +1021,12 @@ function groupTopPerCategory(results, perCategory = 5) {
   return Object.values(grouped).flat();
 }
 
+function withVolunteerServices(services, lat, lng, excludeUserId = "") {
+  const volunteers = findNearbyActiveVolunteers(lat, lng, 8, excludeUserId)
+    .map((row) => publicVolunteerService(row, lat, lng));
+  return [...services, ...volunteers];
+}
+
 app.get("/api/nearby-emergency", async (req, res) => {
   try {
     const { lat, lng } = parseBody(z.object({
@@ -757,7 +1051,7 @@ app.get("/api/nearby-emergency", async (req, res) => {
       return res.json(makeNearbyResponse({
         ...base,
         source: cached.source,
-        services: groupTopPerCategory(cached.data),
+        services: withVolunteerServices(groupTopPerCategory(cached.data), lat, lng),
         cached: true,
         stale: false,
         message: "Fresh cache hit"
@@ -769,7 +1063,7 @@ app.get("/api/nearby-emergency", async (req, res) => {
       return res.json(makeNearbyResponse({
         ...base,
         source: cached.source,
-        services: groupTopPerCategory(cached.data),
+        services: withVolunteerServices(groupTopPerCategory(cached.data), lat, lng),
         cached: true,
         stale: true,
         message: "Stale cache returned, background refresh started"
@@ -782,7 +1076,7 @@ app.get("/api/nearby-emergency", async (req, res) => {
       return res.json(makeNearbyResponse({
         ...base,
         source: liveResult.source,
-        services: groupTopPerCategory(liveResult.data),
+        services: withVolunteerServices(groupTopPerCategory(liveResult.data), lat, lng),
         cached: false,
         stale: false,
         message: `Live data from ${liveResult.source}`
@@ -795,7 +1089,7 @@ app.get("/api/nearby-emergency", async (req, res) => {
       return res.json(makeNearbyResponse({
         ...base,
         source: "seeded",
-        services: groupTopPerCategory(dbResults),
+        services: withVolunteerServices(groupTopPerCategory(dbResults), lat, lng),
         cached: false,
         stale: false,
         message: "Returned stored directory results"
@@ -805,7 +1099,7 @@ app.get("/api/nearby-emergency", async (req, res) => {
     return res.json(makeNearbyResponse({
       ...base,
       source: "fallback",
-      services: [],
+      services: withVolunteerServices([], lat, lng),
       cached: false,
       stale: false,
       message: "No nearby services found. Emergency numbers provided."
