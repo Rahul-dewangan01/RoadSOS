@@ -305,6 +305,10 @@ function generateOtp() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
+function shouldReturnDevOtp() {
+  return process.env.NODE_ENV !== "production" || process.env.ALLOW_DEV_OTP_AUTOFILL === "true";
+}
+
 function getData(userId, key, fallback) {
   const row = db.prepare("SELECT data_json FROM user_data WHERE user_id = ? AND data_key = ?").get(userId, key);
   return row ? JSON.parse(row.data_json) : fallback;
@@ -429,7 +433,7 @@ app.post("/api/auth/request-signup-otp", (req, res, next) => {
     // - Send phoneCode via Twilio SMS to body.phone
     // - Send emailCode via Nodemailer/SendGrid to body.email
 
-    const isDev = process.env.NODE_ENV !== "production";
+    const isDev = shouldReturnDevOtp();
     res.json({
       ok: true,
       devPhoneOtp: isDev ? phoneCode : undefined,
@@ -516,7 +520,7 @@ app.post("/api/auth/request-otp", (req, res, next) => {
     `).run(phone, code, now() + 5 * 60 * 1000);
 
     // Production hook: send code via Twilio Verify
-    const isDev = process.env.NODE_ENV !== "production";
+    const isDev = shouldReturnDevOtp();
     res.json({ ok: true, devOtp: isDev ? code : undefined });
   } catch (error) {
     next(error);
@@ -761,21 +765,35 @@ const UNIVERSAL_FALLBACK = {
   countryCode: "XX",
   countryName: "Unknown",
   numbers: [
-    { name: "International Emergency", phone: "112", serviceType: "EMERGENCY", category: "Emergency" },
-    { name: "Emergency (Americas)", phone: "911", serviceType: "EMERGENCY", category: "Emergency" },
-    { name: "Emergency (UK/AU)", phone: "999", serviceType: "EMERGENCY", category: "Emergency" }
+    { name: "All-in-one Emergency", phone: "112", serviceType: "EMERGENCY_NUMBER", category: "Emergency" },
+    { name: "Police", phone: "100", serviceType: "EMERGENCY_NUMBER", category: "Police" },
+    { name: "Fire", phone: "101", serviceType: "EMERGENCY_NUMBER", category: "Fire" },
+    { name: "Ambulance", phone: "108", serviceType: "EMERGENCY_NUMBER", category: "Ambulance" },
+    { name: "Road Accident / Highway", phone: "1033", serviceType: "EMERGENCY_NUMBER", category: "Highway" },
+    { name: "Disaster Management", phone: "1078", serviceType: "EMERGENCY_NUMBER", category: "Disaster" },
+    { name: "Women Helpline", phone: "1091", serviceType: "EMERGENCY_NUMBER", category: "Women" },
+    { name: "Women Domestic Abuse", phone: "181", serviceType: "EMERGENCY_NUMBER", category: "Women" },
+    { name: "Child Helpline", phone: "1098", serviceType: "EMERGENCY_NUMBER", category: "Child" },
+    { name: "Railway Enquiry", phone: "139", serviceType: "EMERGENCY_NUMBER", category: "Railway" },
+    { name: "Railway Accident Emergency", phone: "1072", serviceType: "EMERGENCY_NUMBER", category: "Railway" },
+    { name: "Senior Citizen Helpline", phone: "14567", serviceType: "EMERGENCY_NUMBER", category: "Senior Citizen" }
   ]
 };
 
 const GLOBAL_EMERGENCY_NUMBERS = {
   IN: { countryCode: "IN", countryName: "India", numbers: [
-    { name: "Police", phone: "100", serviceType: "POLICE", category: "Police Station" },
-    { name: "Ambulance", phone: "102", serviceType: "AMBULANCE", category: "Ambulance" },
-    { name: "Fire", phone: "101", serviceType: "FIRE_STATION", category: "Fire Station" },
-    { name: "Emergency (Unified)", phone: "112", serviceType: "EMERGENCY", category: "Emergency" },
-    { name: "Women Helpline", phone: "1091", serviceType: "OTHER", category: "Helpline" },
-    { name: "Road Accident Emergency", phone: "1073", serviceType: "AMBULANCE", category: "Ambulance" },
-    { name: "National Highway Helpline", phone: "1033", serviceType: "TOW_SERVICE", category: "Tow Service" }
+    { name: "All-in-one Emergency", phone: "112", serviceType: "EMERGENCY_NUMBER", category: "Emergency" },
+    { name: "Police", phone: "100", serviceType: "EMERGENCY_NUMBER", category: "Police" },
+    { name: "Fire", phone: "101", serviceType: "EMERGENCY_NUMBER", category: "Fire" },
+    { name: "Ambulance", phone: "108", serviceType: "EMERGENCY_NUMBER", category: "Ambulance" },
+    { name: "Road Accident / Highway", phone: "1033", serviceType: "EMERGENCY_NUMBER", category: "Highway" },
+    { name: "Disaster Management", phone: "1078", serviceType: "EMERGENCY_NUMBER", category: "Disaster" },
+    { name: "Women Helpline", phone: "1091", serviceType: "EMERGENCY_NUMBER", category: "Women" },
+    { name: "Women Domestic Abuse", phone: "181", serviceType: "EMERGENCY_NUMBER", category: "Women" },
+    { name: "Child Helpline", phone: "1098", serviceType: "EMERGENCY_NUMBER", category: "Child" },
+    { name: "Railway Enquiry", phone: "139", serviceType: "EMERGENCY_NUMBER", category: "Railway" },
+    { name: "Railway Accident Emergency", phone: "1072", serviceType: "EMERGENCY_NUMBER", category: "Railway" },
+    { name: "Senior Citizen Helpline", phone: "14567", serviceType: "EMERGENCY_NUMBER", category: "Senior Citizen" }
   ]},
   US: { countryCode: "US", countryName: "United States", numbers: [
     { name: "Emergency", phone: "911", serviceType: "EMERGENCY", category: "Emergency" },
@@ -1021,20 +1039,46 @@ function groupTopPerCategory(results, perCategory = 5) {
   return Object.values(grouped).flat();
 }
 
-function withVolunteerServices(services, lat, lng, excludeUserId = "") {
+function withVolunteerServices(services, lat, lng, requestedType = "", excludeUserId = "") {
+  if (requestedType && requestedType !== "VOLUNTEER") return services;
   const volunteers = findNearbyActiveVolunteers(lat, lng, 8, excludeUserId)
     .map((row) => publicVolunteerService(row, lat, lng));
   return [...services, ...volunteers];
+}
+
+function normalizeServiceType(value) {
+  const normalized = String(value || "").trim().toUpperCase();
+  const allowed = new Set([
+    "HOSPITAL", "TRAUMA_CENTER", "POLICE", "FIRE_STATION", "AMBULANCE",
+    "TOW_SERVICE", "PUNCTURE_SHOP", "SHOWROOM", "PETROL_PUMP",
+    "MOBILE_REPAIR", "VOLUNTEER"
+  ]);
+  return allowed.has(normalized) ? normalized : "";
+}
+
+function filterByServiceType(items, serviceType) {
+  if (!serviceType) return items;
+  return items.filter((item) => normalizeServiceType(item.serviceType) === serviceType);
+}
+
+function pageServices(items, offset, limit) {
+  return items.slice(offset, offset + limit);
 }
 
 app.get("/api/nearby-emergency", async (req, res) => {
   try {
     const { lat, lng } = parseBody(z.object({
       lat: z.coerce.number().min(-90).max(90),
-      lng: z.coerce.number().min(-180).max(180)
+      lng: z.coerce.number().min(-180).max(180),
+      serviceType: z.string().optional(),
+      limit: z.coerce.number().int().min(1).max(8).optional(),
+      offset: z.coerce.number().int().min(0).max(50).optional()
     }), req.query);
     const radiusMeters = Math.min(Number(req.query.radiusMeters || 8000), 15000);
-    const cacheKey = getCacheKey(lat, lng);
+    const requestedType = normalizeServiceType(req.query.serviceType || "");
+    const limit = Number(req.query.limit || (requestedType ? 5 : 25));
+    const offset = Number(req.query.offset || 0);
+    const cacheKey = `${getCacheKey(lat, lng)}:${requestedType || "ALL"}`;
     const cached = nearbyCache.get(cacheKey);
     const nowMs = Date.now();
 
@@ -1051,7 +1095,7 @@ app.get("/api/nearby-emergency", async (req, res) => {
       return res.json(makeNearbyResponse({
         ...base,
         source: cached.source,
-        services: withVolunteerServices(groupTopPerCategory(cached.data), lat, lng),
+        services: withVolunteerServices(pageServices(groupTopPerCategory(filterByServiceType(cached.data, requestedType)), offset, limit), lat, lng, requestedType),
         cached: true,
         stale: false,
         message: "Fresh cache hit"
@@ -1063,33 +1107,34 @@ app.get("/api/nearby-emergency", async (req, res) => {
       return res.json(makeNearbyResponse({
         ...base,
         source: cached.source,
-        services: withVolunteerServices(groupTopPerCategory(cached.data), lat, lng),
+        services: withVolunteerServices(pageServices(groupTopPerCategory(filterByServiceType(cached.data, requestedType)), offset, limit), lat, lng, requestedType),
         cached: true,
         stale: true,
         message: "Stale cache returned, background refresh started"
       }));
     }
 
-    const liveResult = await fetchLiveWithTimeout(lat, lng, radiusMeters, 6000);
+    const liveResult = await fetchLiveWithTimeout(lat, lng, radiusMeters, 6000, requestedType);
     if (liveResult && liveResult.data.length > 0) {
       nearbyCache.set(cacheKey, { timestamp: Date.now(), data: liveResult.data, source: liveResult.source });
+      const limited = pageServices(groupTopPerCategory(filterByServiceType(liveResult.data, requestedType)), offset, limit);
       return res.json(makeNearbyResponse({
         ...base,
         source: liveResult.source,
-        services: withVolunteerServices(groupTopPerCategory(liveResult.data), lat, lng),
+        services: withVolunteerServices(limited, lat, lng, requestedType),
         cached: false,
         stale: false,
         message: `Live data from ${liveResult.source}`
       }));
     }
 
-    const dbResults = searchStoredEmergencyServices(lat, lng, radiusMeters);
+    const dbResults = filterByServiceType(searchStoredEmergencyServices(lat, lng, radiusMeters), requestedType);
     if (dbResults.length > 0) {
       nearbyCache.set(cacheKey, { timestamp: Date.now(), data: dbResults, source: "seeded" });
       return res.json(makeNearbyResponse({
         ...base,
         source: "seeded",
-        services: withVolunteerServices(groupTopPerCategory(dbResults), lat, lng),
+        services: withVolunteerServices(pageServices(groupTopPerCategory(dbResults), offset, limit), lat, lng, requestedType),
         cached: false,
         stale: false,
         message: "Returned stored directory results"
@@ -1099,7 +1144,7 @@ app.get("/api/nearby-emergency", async (req, res) => {
     return res.json(makeNearbyResponse({
       ...base,
       source: "fallback",
-      services: withVolunteerServices([], lat, lng),
+      services: withVolunteerServices([], lat, lng, requestedType),
       cached: false,
       stale: false,
       message: "No nearby services found. Emergency numbers provided."
@@ -1117,10 +1162,10 @@ app.get("/api/nearby-emergency", async (req, res) => {
   }
 });
 
-async function fetchLiveWithTimeout(lat, lng, radiusMeters, timeoutMs) {
+async function fetchLiveWithTimeout(lat, lng, radiusMeters, timeoutMs, serviceType = "") {
   try {
     const result = await Promise.race([
-      fetchLiveEmergencyData(lat, lng, radiusMeters),
+      fetchLiveEmergencyData(lat, lng, radiusMeters, serviceType),
       new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), timeoutMs))
     ]);
     return result;
@@ -1129,10 +1174,10 @@ async function fetchLiveWithTimeout(lat, lng, radiusMeters, timeoutMs) {
   }
 }
 
-async function fetchLiveEmergencyData(lat, lng, radiusMeters) {
+async function fetchLiveEmergencyData(lat, lng, radiusMeters, serviceType = "") {
   if (process.env.GOOGLE_MAPS_API_KEY) {
     try {
-      const results = await searchGoogleEmergencyPlaces(lat, lng, radiusMeters);
+      const results = await searchGoogleEmergencyPlaces(lat, lng, radiusMeters, serviceType);
       if (results.length > 0) return { source: "google", data: results };
     } catch (e) {
       console.error("Google Places failed:", e.message);
@@ -1140,7 +1185,7 @@ async function fetchLiveEmergencyData(lat, lng, radiusMeters) {
   }
 
   try {
-    const results = await searchOverpassEmergencyPlaces(lat, lng, radiusMeters);
+    const results = await searchOverpassEmergencyPlaces(lat, lng, radiusMeters, serviceType);
     if (results.length > 0) return { source: "osm", data: results };
   } catch (e) {
     console.error("Overpass failed:", e.message);
@@ -1152,7 +1197,7 @@ async function fetchLiveEmergencyData(lat, lng, radiusMeters) {
 function fireBackgroundRefresh(lat, lng, radiusMeters, cacheKey) {
   if (pendingRefreshes.has(cacheKey)) return;
   pendingRefreshes.add(cacheKey);
-  fetchLiveEmergencyData(lat, lng, radiusMeters)
+  fetchLiveEmergencyData(lat, lng, radiusMeters, "")
     .then((result) => {
       if (result && result.data.length > 0) {
         nearbyCache.set(cacheKey, { timestamp: Date.now(), data: result.data, source: result.source });
@@ -1203,6 +1248,8 @@ const CATEGORY_SERVICE_TYPE = {
   "Mechanic": "TOW_SERVICE",
   "Puncture Shop": "PUNCTURE_SHOP",
   "Showroom": "SHOWROOM",
+  "Petrol Pump": "PETROL_PUMP",
+  "Mobile Store / Repair": "MOBILE_REPAIR",
   "Pharmacy": "OTHER"
 };
 
@@ -1213,17 +1260,19 @@ function addServiceType(items) {
   }));
 }
 
-async function searchGoogleEmergencyPlaces(lat, lng, radiusMeters) {
+async function searchGoogleEmergencyPlaces(lat, lng, radiusMeters, serviceType = "") {
   const queries = [
-    ["Hospital", "hospital near me"],
-    ["Trauma Center", "trauma center emergency hospital"],
-    ["Police Station", "police station"],
-    ["Fire Station", "fire station"],
-    ["Ambulance", "ambulance station"],
-    ["Tow Service", "vehicle rescue towing service roadside assistance"],
-    ["Puncture Shop", "tyre repair puncture shop"],
-    ["Showroom", "car dealership showroom"]
-  ];
+    ["Hospital", "hospital near me", "HOSPITAL"],
+    ["Trauma Center", "trauma center emergency hospital", "TRAUMA_CENTER"],
+    ["Police Station", "police station", "POLICE"],
+    ["Fire Station", "fire station", "FIRE_STATION"],
+    ["Ambulance", "ambulance station", "AMBULANCE"],
+    ["Tow Service", "vehicle rescue towing service roadside assistance", "TOW_SERVICE"],
+    ["Puncture Shop", "tyre repair puncture shop", "PUNCTURE_SHOP"],
+    ["Showroom", "car dealership showroom", "SHOWROOM"],
+    ["Petrol Pump", "petrol pump fuel station", "PETROL_PUMP"],
+    ["Mobile Store / Repair", "mobile phone repair store", "MOBILE_REPAIR"]
+  ].filter(([, , type]) => !serviceType || type === serviceType);
   const all = [];
   for (const [category, textQuery] of queries) {
     try {
@@ -1271,7 +1320,7 @@ async function searchGoogleEmergencyPlaces(lat, lng, radiusMeters) {
   return addServiceType(uniqueByNameAndDistance(all).sort((a, b) => a.distanceKm - b.distanceKm));
 }
 
-async function searchOverpassEmergencyPlaces(lat, lng, radiusMeters) {
+async function searchOverpassEmergencyPlaces(lat, lng, radiusMeters, serviceType = "") {
   const emergencyRadius = Math.min(radiusMeters, 5000);
   const autoRadius = Math.min(radiusMeters, 8000);
 
@@ -1309,6 +1358,25 @@ async function searchOverpassEmergencyPlaces(lat, lng, radiusMeters) {
     out center tags;
   `;
 
+  const petrolQuery = `
+    [out:json][timeout:5];
+    (
+      node(around:${autoRadius},${lat},${lng})["amenity"="fuel"];
+      way(around:${autoRadius},${lat},${lng})["amenity"="fuel"];
+    );
+    out center tags;
+  `;
+
+  const mobileQuery = `
+    [out:json][timeout:5];
+    (
+      node(around:${autoRadius},${lat},${lng})["shop"~"mobile_phone|electronics"];
+      way(around:${autoRadius},${lat},${lng})["shop"~"mobile_phone|electronics"];
+      node(around:${autoRadius},${lat},${lng})["craft"~"electronics_repair|phone_repair"];
+    );
+    out center tags;
+  `;
+
   const endpoints = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter"
@@ -1334,11 +1402,13 @@ async function searchOverpassEmergencyPlaces(lat, lng, radiusMeters) {
     return [];
   }
 
-  const results = await Promise.allSettled([
-    runQueryWithFailover(emergencyQuery),
-    runQueryWithFailover(healthcareQuery),
-    runQueryWithFailover(autoQuery)
-  ]);
+  const queryJobs = [];
+  if (!serviceType || ["HOSPITAL", "TRAUMA_CENTER", "POLICE", "FIRE_STATION", "AMBULANCE"].includes(serviceType)) queryJobs.push(runQueryWithFailover(emergencyQuery), runQueryWithFailover(healthcareQuery));
+  if (!serviceType || ["TOW_SERVICE", "PUNCTURE_SHOP", "SHOWROOM"].includes(serviceType)) queryJobs.push(runQueryWithFailover(autoQuery));
+  if (!serviceType || serviceType === "PETROL_PUMP") queryJobs.push(runQueryWithFailover(petrolQuery));
+  if (!serviceType || serviceType === "MOBILE_REPAIR") queryJobs.push(runQueryWithFailover(mobileQuery));
+
+  const results = await Promise.allSettled(queryJobs);
 
   const allElements = [];
   for (const r of results) {
@@ -1372,7 +1442,7 @@ async function searchOverpassEmergencyPlaces(lat, lng, radiusMeters) {
     });
   }
 
-  return addServiceType(uniqueByNameAndDistance(places).sort((a, b) => a.distanceKm - b.distanceKm));
+  return filterByServiceType(addServiceType(uniqueByNameAndDistance(places).sort((a, b) => a.distanceKm - b.distanceKm)), serviceType);
 }
 
 function categoryFromOsm(tags) {
@@ -1386,6 +1456,8 @@ function categoryFromOsm(tags) {
   if (/towing|roadside/i.test(tags.service || "")) return "Tow Service";
   if (tags.shop === "car_repair") return "Tow Service";
   if (tags.shop === "car" || tags.shop === "motorcycle" || /dealer|showroom/i.test(tags.name || "")) return "Showroom";
+  if (tags.amenity === "fuel") return "Petrol Pump";
+  if (/mobile_phone|electronics/i.test(tags.shop || "") || /phone|mobile/i.test(tags.name || "")) return "Mobile Store / Repair";
   if (tags.amenity === "hospital" || tags.healthcare === "hospital") return "Hospital";
   if (tags.amenity === "clinic") return "Hospital";
   return "Hospital";
