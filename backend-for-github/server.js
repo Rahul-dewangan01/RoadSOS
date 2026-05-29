@@ -306,7 +306,7 @@ function generateOtp() {
 }
 
 function shouldReturnDevOtp() {
-  return process.env.NODE_ENV !== "production" || process.env.ALLOW_DEV_OTP_AUTOFILL === "true";
+  return process.env.DISABLE_DEV_OTP_AUTOFILL !== "true";
 }
 
 function getData(userId, key, fallback) {
