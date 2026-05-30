@@ -1050,7 +1050,7 @@ function normalizeServiceType(value) {
   const normalized = String(value || "").trim().toUpperCase();
   const allowed = new Set([
     "HOSPITAL", "TRAUMA_CENTER", "POLICE", "FIRE_STATION", "AMBULANCE",
-    "TOW_SERVICE", "PUNCTURE_SHOP", "SHOWROOM", "PETROL_PUMP",
+    "DOCTOR", "CLINIC", "PHARMACY", "TOW_SERVICE", "MECHANIC", "PUNCTURE_SHOP", "SHOWROOM", "PETROL_PUMP",
     "MOBILE_REPAIR", "VOLUNTEER"
   ]);
   return allowed.has(normalized) ? normalized : "";
@@ -1071,8 +1071,8 @@ app.get("/api/nearby-emergency", async (req, res) => {
       lat: z.coerce.number().min(-90).max(90),
       lng: z.coerce.number().min(-180).max(180),
       serviceType: z.string().optional(),
-      limit: z.coerce.number().int().min(1).max(8).optional(),
-      offset: z.coerce.number().int().min(0).max(50).optional()
+      limit: z.coerce.number().int().min(1).max(50).optional(),
+      offset: z.coerce.number().int().min(0).max(500).optional()
     }), req.query);
     const radiusMeters = Math.min(Number(req.query.radiusMeters || 8000), 15000);
     const requestedType = normalizeServiceType(req.query.serviceType || "");
@@ -1243,14 +1243,16 @@ const CATEGORY_SERVICE_TYPE = {
   "Police Station": "POLICE",
   "Fire Station": "FIRE_STATION",
   "Ambulance": "AMBULANCE",
+  "Doctor": "DOCTOR",
+  "Clinic": "CLINIC",
+  "Pharmacy": "PHARMACY",
   "Tow Service": "TOW_SERVICE",
   "Vehicle Rescue": "TOW_SERVICE",
-  "Mechanic": "TOW_SERVICE",
+  "Mechanic": "MECHANIC",
   "Puncture Shop": "PUNCTURE_SHOP",
   "Showroom": "SHOWROOM",
   "Petrol Pump": "PETROL_PUMP",
-  "Mobile Store / Repair": "MOBILE_REPAIR",
-  "Pharmacy": "OTHER"
+  "Mobile Store / Repair": "MOBILE_REPAIR"
 };
 
 function addServiceType(items) {
@@ -1267,7 +1269,11 @@ async function searchGoogleEmergencyPlaces(lat, lng, radiusMeters, serviceType =
     ["Police Station", "police station", "POLICE"],
     ["Fire Station", "fire station", "FIRE_STATION"],
     ["Ambulance", "ambulance station", "AMBULANCE"],
+    ["Doctor", "doctor clinic physician near me", "DOCTOR"],
+    ["Clinic", "clinic health centre near me", "CLINIC"],
+    ["Pharmacy", "pharmacy chemist medical store near me", "PHARMACY"],
     ["Tow Service", "vehicle rescue towing service roadside assistance", "TOW_SERVICE"],
+    ["Mechanic", "mechanic garage car repair near me", "MECHANIC"],
     ["Puncture Shop", "tyre repair puncture shop", "PUNCTURE_SHOP"],
     ["Showroom", "car dealership showroom", "SHOWROOM"],
     ["Petrol Pump", "petrol pump fuel station", "PETROL_PUMP"],
@@ -1339,8 +1345,12 @@ async function searchOverpassEmergencyPlaces(lat, lng, radiusMeters, serviceType
     (
       node(around:${emergencyRadius},${lat},${lng})["amenity"="clinic"];
       way(around:${emergencyRadius},${lat},${lng})["amenity"="clinic"];
-      node(around:${emergencyRadius},${lat},${lng})["healthcare"~"hospital|emergency"];
-      way(around:${emergencyRadius},${lat},${lng})["healthcare"~"hospital|emergency"];
+      node(around:${emergencyRadius},${lat},${lng})["amenity"="doctors"];
+      way(around:${emergencyRadius},${lat},${lng})["amenity"="doctors"];
+      node(around:${emergencyRadius},${lat},${lng})["amenity"="pharmacy"];
+      way(around:${emergencyRadius},${lat},${lng})["amenity"="pharmacy"];
+      node(around:${emergencyRadius},${lat},${lng})["healthcare"~"hospital|emergency|clinic|doctor|pharmacy"];
+      way(around:${emergencyRadius},${lat},${lng})["healthcare"~"hospital|emergency|clinic|doctor|pharmacy"];
     );
     out center tags;
   `;
@@ -1350,6 +1360,7 @@ async function searchOverpassEmergencyPlaces(lat, lng, radiusMeters, serviceType
     (
       node(around:${autoRadius},${lat},${lng})["shop"~"car_repair|tyres"];
       way(around:${autoRadius},${lat},${lng})["shop"~"car_repair|tyres"];
+      node(around:${autoRadius},${lat},${lng})["amenity"="vehicle_inspection"];
       node(around:${autoRadius},${lat},${lng})["craft"~"tyre|puncture|mechanic"];
       node(around:${autoRadius},${lat},${lng})["service"~"towing|roadside_assistance"];
       node(around:${autoRadius},${lat},${lng})["shop"~"car|motorcycle"];
@@ -1403,8 +1414,8 @@ async function searchOverpassEmergencyPlaces(lat, lng, radiusMeters, serviceType
   }
 
   const queryJobs = [];
-  if (!serviceType || ["HOSPITAL", "TRAUMA_CENTER", "POLICE", "FIRE_STATION", "AMBULANCE"].includes(serviceType)) queryJobs.push(runQueryWithFailover(emergencyQuery), runQueryWithFailover(healthcareQuery));
-  if (!serviceType || ["TOW_SERVICE", "PUNCTURE_SHOP", "SHOWROOM"].includes(serviceType)) queryJobs.push(runQueryWithFailover(autoQuery));
+  if (!serviceType || ["HOSPITAL", "TRAUMA_CENTER", "POLICE", "FIRE_STATION", "AMBULANCE", "DOCTOR", "CLINIC", "PHARMACY"].includes(serviceType)) queryJobs.push(runQueryWithFailover(emergencyQuery), runQueryWithFailover(healthcareQuery));
+  if (!serviceType || ["TOW_SERVICE", "MECHANIC", "PUNCTURE_SHOP", "SHOWROOM"].includes(serviceType)) queryJobs.push(runQueryWithFailover(autoQuery));
   if (!serviceType || serviceType === "PETROL_PUMP") queryJobs.push(runQueryWithFailover(petrolQuery));
   if (!serviceType || serviceType === "MOBILE_REPAIR") queryJobs.push(runQueryWithFailover(mobileQuery));
 
@@ -1451,10 +1462,12 @@ function categoryFromOsm(tags) {
   if (tags.emergency === "ambulance_station") return "Ambulance";
   if (tags.healthcare === "emergency" || /trauma/i.test(tags.name || "")) return "Trauma Center";
   if (tags.amenity === "clinic" && /emergency/i.test(tags.healthcare || tags["emergency"] || "")) return "Trauma Center";
+  if (tags.amenity === "doctors" || tags.healthcare === "doctor") return "Doctor";
+  if (tags.amenity === "pharmacy" || tags.healthcare === "pharmacy") return "Pharmacy";
+  if (tags.amenity === "clinic" || tags.healthcare === "clinic") return "Clinic";
   if (tags.shop === "tyres" || tags.craft === "tyre" || /puncture|tyre.*repair/i.test(tags.name || "")) return "Puncture Shop";
-  if (tags.craft === "mechanic") return "Mechanic";
+  if (tags.craft === "mechanic" || tags.shop === "car_repair") return "Mechanic";
   if (/towing|roadside/i.test(tags.service || "")) return "Tow Service";
-  if (tags.shop === "car_repair") return "Tow Service";
   if (tags.shop === "car" || tags.shop === "motorcycle" || /dealer|showroom/i.test(tags.name || "")) return "Showroom";
   if (tags.amenity === "fuel") return "Petrol Pump";
   if (/mobile_phone|electronics/i.test(tags.shop || "") || /phone|mobile/i.test(tags.name || "")) return "Mobile Store / Repair";
