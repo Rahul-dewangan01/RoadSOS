@@ -3,6 +3,8 @@ import express from "express";
 import helmet from "helmet";
 import morgan from "morgan";
 import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { nanoid } from "nanoid";
 import { z } from "zod";
@@ -1529,6 +1531,210 @@ function importEmergencyDirectory() {
     if (error.code !== "ENOENT") console.error("Emergency directory import failed", error.message);
   }
 }
+
+// ─── Centralized Pack Generation ───────────────────────────────────────────────
+
+const PACKS_DIR = path.resolve("./packs");
+const PACK_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+try { fs.mkdirSync(PACKS_DIR, { recursive: true }); } catch (_) {}
+
+function packChecksum(payload) {
+  return crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+}
+
+function packCacheKey(countryCode, stateName, scopeType, minLat, maxLat, minLng, maxLng) {
+  const normalize = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+  const coord = (n) => Number(n).toFixed(3).replace("-", "m").replace(".", "p");
+  return [
+    "pack_v2",
+    normalize(countryCode || "world"),
+    normalize(scopeType || "state"),
+    normalize(stateName || "region"),
+    coord(minLat),
+    coord(maxLat),
+    coord(minLng),
+    coord(maxLng)
+  ].join("_");
+}
+
+async function generatePackPois(minLat, maxLat, minLng, maxLng) {
+  const lat = (minLat + maxLat) / 2;
+  const lng = (minLng + maxLng) / 2;
+  const bbox = `${minLat},${minLng},${maxLat},${maxLng}`;
+  const radiusMeters = Math.min(distanceKm(minLat, minLng, maxLat, maxLng) * 500, 50000);
+  const allPois = [];
+
+  console.log(`[PackGen] Generating pack for bbox=${bbox}, center=${lat},${lng}, radius=${radiusMeters}m`);
+
+  try {
+    const stored = db.prepare("SELECT * FROM emergency_services").all()
+      .filter((row) => row.latitude >= minLat && row.latitude <= maxLat && row.longitude >= minLng && row.longitude <= maxLng)
+      .map((row) => ({
+        id: row.id,
+        name: row.name,
+        category: row.type,
+        serviceType: CATEGORY_SERVICE_TYPE[row.type] || "OTHER",
+        distanceKm: 0,
+        phone: row.phone || "",
+        address: row.address || "",
+        lat: row.latitude,
+        lng: row.longitude,
+        source: "stored_directory",
+        isOfflineFallback: true
+      }));
+    allPois.push(...stored);
+    console.log(`[PackGen] Stored directory: ${stored.length} POIs`);
+  } catch (e) {
+    console.error("[PackGen] Stored directory query failed:", e.message);
+  }
+
+  try {
+    const bulkQuery = `
+      [out:json][timeout:90];
+      (
+        node["amenity"~"hospital|police|fire_station|pharmacy|doctors|clinic|fuel"](${bbox});
+        way["amenity"~"hospital|police|fire_station|pharmacy|doctors|clinic|fuel"](${bbox});
+        node["shop"="car_repair"](${bbox});
+        node["emergency"~"ambulance_station|phone"](${bbox});
+        way["amenity"="hospital"]["emergency"="yes"](${bbox});
+        node["shop"~"tyres|car|motorcycle"](${bbox});
+        way["shop"~"tyres|car|motorcycle"](${bbox});
+        node["craft"~"mechanic|tyre"](${bbox});
+      );
+      out center 20000;
+    `;
+    const overpassMirrors = [
+      "https://overpass-api.de/api/interpreter",
+      "https://overpass.kumi.systems/api/interpreter",
+      "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
+    ];
+
+    for (const mirror of overpassMirrors) {
+      try {
+        console.log(`[PackGen] Trying Overpass mirror: ${mirror}`);
+        const resp = await fetch(mirror, {
+          method: "POST",
+          signal: AbortSignal.timeout(120000),
+          headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "RoadSOS-Backend/1.0" },
+          body: new URLSearchParams({ data: bulkQuery }).toString()
+        });
+        if (!resp.ok) {
+          console.warn(`[PackGen] Overpass mirror ${mirror} returned ${resp.status}`);
+          continue;
+        }
+        const json = await resp.json();
+        const seenIds = new Set();
+        const overpassPois = [];
+        for (const item of json.elements || []) {
+          const id = `osm_${item.id}`;
+          if (seenIds.has(id)) continue;
+          seenIds.add(id);
+          const tags = item.tags || {};
+          const pLat = item.lat || item.center?.lat;
+          const pLng = item.lon || item.center?.lon;
+          if (!pLat || !pLng) continue;
+          const cat = categoryFromOsm(tags);
+          const svcType = CATEGORY_SERVICE_TYPE[cat] || "OTHER";
+          if (svcType === "OTHER") continue;
+          overpassPois.push({
+            id,
+            name: tags.name || tags.operator || `${cat} (unnamed)`,
+            category: cat,
+            serviceType: svcType,
+            distanceKm: 0,
+            phone: (tags.phone || tags["contact:phone"] || "").replace(/[^0-9+\-\s]/g, "").trim(),
+            address: [tags["addr:street"], tags["addr:city"], tags["addr:state"], tags["addr:postcode"]].filter(Boolean).join(", ") || tags["addr:full"] || "",
+            lat: pLat,
+            lng: pLng,
+            source: "openstreetmap",
+            isOfflineFallback: true
+          });
+        }
+        allPois.push(...overpassPois);
+        console.log(`[PackGen] Overpass parsed: ${overpassPois.length} valid POIs`);
+        break;
+      } catch (e) {
+        console.warn(`[PackGen] Overpass mirror ${mirror} failed: ${e.message}`);
+      }
+    }
+  } catch (e) {
+    console.error("[PackGen] All Overpass queries failed:", e.message);
+  }
+
+  if (process.env.GOOGLE_MAPS_API_KEY && allPois.length < 100) {
+    try {
+      const googleMapped = (await searchGoogleEmergencyPlaces(lat, lng, radiusMeters)).map((p) => ({ ...p, isOfflineFallback: true }));
+      allPois.push(...googleMapped);
+      console.log(`[PackGen] Google Places added: ${googleMapped.length} POIs`);
+    } catch (e) {
+      console.warn(`[PackGen] Google Places failed: ${e.message}`);
+    }
+  }
+
+  const seen = new Set();
+  const deduped = allPois.filter((poi) => {
+    const key = `${poi.name?.toLowerCase()}_${Number(poi.lat).toFixed(4)}_${Number(poi.lng).toFixed(4)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  console.log(`[PackGen] Final: ${deduped.length} unique POIs (from ${allPois.length} total before dedup)`);
+  return deduped;
+}
+
+app.post("/api/packs/generate", async (req, res) => {
+  try {
+    const { minLat, maxLat, minLng, maxLng, countryCode, countryName, stateName, scopeType } = req.body || {};
+    if (typeof minLat !== "number" || typeof maxLat !== "number" || typeof minLng !== "number" || typeof maxLng !== "number") {
+      return res.status(400).json({ success: false, error: "Missing or invalid bounding box coordinates (minLat, maxLat, minLng, maxLng required)" });
+    }
+
+    const cacheKey = packCacheKey(countryCode, stateName, scopeType, minLat, maxLat, minLng, maxLng);
+    const cachePath = path.join(PACKS_DIR, `${cacheKey}.json`);
+    console.log(`[PackGen] Request: key=${cacheKey}, bbox=[${minLat},${minLng}]-[${maxLat},${maxLng}], state=${stateName}, country=${countryName}`);
+
+    try {
+      const stat = fs.statSync(cachePath);
+      const age = Date.now() - stat.mtimeMs;
+      if (age < PACK_CACHE_MAX_AGE_MS) {
+        const cachedText = fs.readFileSync(cachePath, "utf8");
+        const cached = JSON.parse(cachedText);
+        console.log(`[PackGen] Cache hit: ${cacheKey}, pois=${cached.poiCount || cached.pois?.length || 0}, bytes=${Buffer.byteLength(cachedText)}, checksum=${cached.checksum || "missing"}`);
+        return res.json(cached);
+      }
+    } catch (_) {
+      console.log(`[PackGen] Cache miss: ${cacheKey}`);
+    }
+
+    const pois = await generatePackPois(minLat, maxLat, minLng, maxLng);
+    const result = {
+      success: true,
+      packName: `${stateName || countryName || "Region"} Offline Nearby Pack`,
+      countryCode: countryCode || "",
+      countryName: countryName || "",
+      stateName: stateName || "",
+      scopeType: scopeType || "state",
+      pois,
+      generatedAt: Date.now(),
+      poiCount: pois.length
+    };
+    result.checksum = packChecksum(result);
+    result.contentLength = Buffer.byteLength(JSON.stringify(result));
+
+    try {
+      fs.writeFileSync(cachePath, JSON.stringify(result), "utf8");
+      console.log(`[PackGen] Cached: ${cacheKey} (${pois.length} POIs, ${result.contentLength} bytes, checksum=${result.checksum})`);
+    } catch (e) {
+      console.error("[PackGen] Cache write failed:", e.message);
+    }
+
+    res.json(result);
+  } catch (error) {
+    console.error("[PackGen] Error:", error.message);
+    res.status(500).json({ success: false, error: `Pack generation failed: ${error.message}` });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`Road SoS backend running on http://localhost:${PORT}`);
