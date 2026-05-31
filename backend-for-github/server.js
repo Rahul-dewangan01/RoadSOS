@@ -311,6 +311,56 @@ function shouldReturnDevOtp() {
   return process.env.DISABLE_DEV_OTP_AUTOFILL !== "true";
 }
 
+function googleClientIds() {
+  return String(process.env.GOOGLE_CLIENT_IDS || process.env.GOOGLE_CLIENT_ID || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+}
+
+async function verifyGoogleIdToken(idToken, expectedEmail = "") {
+  if (!idToken) {
+    const err = new Error("Invalid Google sign-in: missing ID token.");
+    err.statusCode = 401;
+    throw err;
+  }
+  const allowedClientIds = googleClientIds();
+  if (allowedClientIds.length === 0 && process.env.ALLOW_UNVERIFIED_GOOGLE_AUTH !== "true") {
+    const err = new Error("Google sign-in is not configured on the backend. Set GOOGLE_CLIENT_ID to the Web OAuth client ID.");
+    err.statusCode = 500;
+    throw err;
+  }
+  if (process.env.ALLOW_UNVERIFIED_GOOGLE_AUTH === "true" && allowedClientIds.length === 0) {
+    return { email: expectedEmail, name: "", sub: "unverified-dev", picture: "" };
+  }
+
+  const response = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`, {
+    signal: AbortSignal.timeout(8000)
+  });
+  if (!response.ok) {
+    const err = new Error("Invalid Google sign-in token.");
+    err.statusCode = 401;
+    throw err;
+  }
+  const payload = await response.json();
+  if (!allowedClientIds.includes(payload.aud)) {
+    const err = new Error("Google sign-in token audience does not match this app.");
+    err.statusCode = 401;
+    throw err;
+  }
+  if (payload.email_verified !== "true" && payload.email_verified !== true) {
+    const err = new Error("Google account email is not verified.");
+    err.statusCode = 401;
+    throw err;
+  }
+  if (expectedEmail && String(payload.email || "").toLowerCase() !== expectedEmail.toLowerCase()) {
+    const err = new Error("Google account email does not match the selected account.");
+    err.statusCode = 401;
+    throw err;
+  }
+  return payload;
+}
+
 function getData(userId, key, fallback) {
   const row = db.prepare("SELECT data_json FROM user_data WHERE user_id = ? AND data_key = ?").get(userId, key);
   return row ? JSON.parse(row.data_json) : fallback;
@@ -546,26 +596,83 @@ app.post("/api/auth/verify-otp", (req, res, next) => {
   }
 });
 
-// Google sign-in (for existing accounts linked by Google)
-app.post("/api/auth/google", (req, res, next) => {
+app.post("/api/auth/google/request-phone-otp", async (req, res, next) => {
+  try {
+    const body = parseBody(z.object({
+      phone: phoneSchema,
+      email: emailSchema,
+      googleIdToken: z.string().min(1)
+    }), req.body);
+    const googlePayload = await verifyGoogleIdToken(body.googleIdToken, body.email);
+    console.log(`[GoogleAuth] Phone OTP request: email=${googlePayload.email}, phoneSuffix=${body.phone.slice(-4)}`);
+
+    const existingByPhone = getUserByPhone(body.phone);
+    if (existingByPhone && existingByPhone.email !== body.email) {
+      return res.status(409).json({ error: "This phone number belongs to another Road SoS account." });
+    }
+    const existingByEmail = getUserByEmail(body.email);
+    if (existingByEmail) {
+      return res.json({ ok: true });
+    }
+
+    const code = generateOtp();
+    db.prepare(`
+      INSERT INTO otps (phone, code, expires_at) VALUES (?, ?, ?)
+      ON CONFLICT(phone) DO UPDATE SET code = excluded.code, expires_at = excluded.expires_at
+    `).run(body.phone, code, now() + 5 * 60 * 1000);
+
+    res.json({ ok: true, devOtp: shouldReturnDevOtp() ? code : undefined });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Google sign-in/sign-up. Existing emails sign in; new users need verified phone OTP once.
+app.post("/api/auth/google", async (req, res, next) => {
   try {
     const body = parseBody(z.object({
       fullName: z.string().trim().min(1),
-      phone: phoneSchema,
+      phone: phoneSchema.optional().or(z.literal("")).optional(),
+      phoneOtp: z.string().min(4).max(8).optional().or(z.literal("")).optional(),
       email: emailSchema,
-      googleIdToken: z.string().optional()
+      googleIdToken: z.string().min(1)
     }), req.body);
-    // Production hook: verify body.googleIdToken against GOOGLE_CLIENT_ID here.
+    const googlePayload = await verifyGoogleIdToken(body.googleIdToken, body.email);
+    console.log(`[GoogleAuth] Backend auth started: email=${googlePayload.email}, hasPhone=${Boolean(body.phone)}`);
 
-    // Check if user exists; if so, log in. Otherwise, reject (require full signup).
-    const existingByPhone = getUserByPhone(body.phone);
     const existingByEmail = getUserByEmail(body.email);
-    const existing = existingByPhone || existingByEmail;
-    if (!existing) {
-      return res.status(404).json({ error: "No account found. Please sign up first." });
+    if (existingByEmail) {
+      console.log(`[GoogleAuth] Existing account signed in: user=${existingByEmail.id}`);
+      return res.json({ token: makeToken(existingByEmail.id), user: publicUser(existingByEmail) });
     }
-    res.json({ token: makeToken(existing.id), user: publicUser(existing) });
+
+    if (!body.phone || !body.phoneOtp) {
+      return res.status(404).json({ error: "GOOGLE_PHONE_REQUIRED: Verify your phone number to create your Road SoS account." });
+    }
+
+    const existingByPhone = getUserByPhone(body.phone);
+    if (existingByPhone) {
+      return res.status(409).json({ error: "This phone number belongs to another Road SoS account. Use phone login or a different number." });
+    }
+
+    const otpRow = db.prepare("SELECT * FROM otps WHERE phone = ?").get(body.phone);
+    if (!otpRow || otpRow.code !== body.phoneOtp || otpRow.expires_at < now()) {
+      return res.status(401).json({ error: "Invalid or expired phone OTP" });
+    }
+    db.prepare("DELETE FROM otps WHERE phone = ?").run(body.phone);
+
+    const ts = now();
+    const id = nanoid(24);
+    db.prepare(`
+      INSERT INTO users (id, full_name, phone, email, dob, gender, permanent_address, temporary_address, profile_image_base64, provider, created_at, updated_at)
+      VALUES (?, ?, ?, ?, '', '', '', '', ?, 'google', ?, ?)
+    `).run(id, body.fullName || googlePayload.name || body.email, body.phone, body.email, googlePayload.picture || null, ts, ts);
+
+    const user = getUserById(id);
+    console.log(`[GoogleAuth] New Google account created: user=${id}, email=${body.email}`);
+    res.status(201).json({ token: makeToken(user.id), user: publicUser(user) });
   } catch (error) {
+    console.error(`[GoogleAuth] Failed: ${error.message}`);
     next(error);
   }
 });
