@@ -6,7 +6,7 @@
 
 ## Team Details
 
-**Team Name:** Team Mahaveer
+**Team Name:** Team Sankatmochan
 
 **Team Members:**
 
